@@ -97,7 +97,11 @@ func WriteError(context *gin.Context, err error) {
 	if appError.Status >= 500 {
 		slog.Error("request failed", "request_id", RequestID(context), "code", appError.Code, "error", appError.Error())
 	}
-	context.AbortWithStatusJSON(appError.Status, gin.H{"error": gin.H{"code": appError.Code, "message": appError.Message}, "request_id": RequestID(context)})
+	errorBody := gin.H{"code": appError.Code, "message": appError.Message}
+	if len(appError.Details) > 0 {
+		errorBody["details"] = appError.Details
+	}
+	context.AbortWithStatusJSON(appError.Status, gin.H{"error": errorBody, "request_id": RequestID(context)})
 }
 
 func Actor(context *gin.Context) dto.Actor {

@@ -50,6 +50,7 @@ docker compose down -v --remove-orphans
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
 - 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
 - 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
+- 新鲜度闸门：评估提交后若又写入核验记录或调整人员限值，评估详情会列出变化与期间剂量净差异并阻止 RPO 接受（`409 stale_assessment_inputs`）；`reassess` 生成新评估，旧快照标记 `superseded` 永久可追溯，原提交/复核流程不变。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
 
 ## 公式、周期与阈值
@@ -128,10 +129,18 @@ docker compose down -v --remove-orphans
 | GET/POST | `/assessments[/:id]` | 列表、详情和不可变评估 |
 | POST | `/assessments/compare` | 同一人员多计划情景比较 |
 | POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
+| POST | `/assessments/:id/reassess` | 复核中数据过期时用新评估取代旧快照 |
 | POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
 | GET | `/audit` | RPO/admin 查询审计 |
 
-错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict` 和 `forbidden`。
+错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict`、`stale_assessment` 和 `forbidden`。
+
+### 快照新鲜度与重新评估
+
+- 评估提交后，详情/列表响应会附带 `freshness` 报告：用评估当时冻结的期间窗口、记录 ID 集合和限值，重放当前已核验台账与人员限值。
+- 报告列出新增/移除的核验记录（含更正 reversal/replacement）、调整过的行政/法规限值，以及**期间剂量净差异** `period_dose_delta_msv`（更正链可能为负，不做零钳制）。
+- RPO 仅在 `freshness.fresh=true` 时可执行接受；发现记录或限值变化时返回 `409 stale_assessment_inputs`，`error.details` 内含明确过期原因码（`verified_exposure_records_changed`、`worker_limits_changed`、`exposure_records_and_limits_changed`）与净差异。拒绝陈旧情景始终允许。
+- 计划人员调用 `reassess` 基于当前输入生成**新评估**：旧评估置为 `superseded` 且不删除、不覆盖，仍可通过详情与审计追溯；计划状态由 `pending_rpo_review` 回到 `assessed`，随后正常走“提交→复核”流程。
 
 ## 枚举位置
 

@@ -29,9 +29,11 @@ func IsPermitStatus(value string) bool {
 
 func CanTransitionPermit(from, to string) bool {
 	allowed := map[string]map[string]bool{
-		PermitStatusDraft:            {PermitStatusAssessed: true},
-		PermitStatusAssessed:         {PermitStatusAssessed: true, PermitStatusPendingRPOReview: true},
-		PermitStatusPendingRPOReview: {PermitStatusPlanningAccepted: true, PermitStatusRejected: true},
+		PermitStatusDraft:    {PermitStatusAssessed: true},
+		PermitStatusAssessed: {PermitStatusAssessed: true, PermitStatusPendingRPOReview: true},
+		// A fresh assessment that supersedes a stale review queue entry returns
+		// the plan to assessed; the immutable superseded assessment stays traceable.
+		PermitStatusPendingRPOReview: {PermitStatusPlanningAccepted: true, PermitStatusRejected: true, PermitStatusAssessed: true},
 		PermitStatusPlanningAccepted: {PermitStatusArchived: true},
 		PermitStatusRejected:         {PermitStatusArchived: true},
 	}

@@ -15,5 +15,6 @@ func registerDoseBudgetAssessmentRoutes(group *gin.RouterGroup, target *handler.
 	routes.POST("", middleware.RBAC(constants.RolePlanner, constants.RoleAdmin), target.Assess)
 	routes.POST("/compare", middleware.RBAC(constants.RolePlanner, constants.RoleAdmin), target.Compare)
 	routes.POST("/:id/submit", middleware.RBAC(constants.RolePlanner, constants.RoleAdmin), target.Submit)
+	routes.POST("/:id/reassess", middleware.RBAC(constants.RolePlanner, constants.RoleAdmin), target.Reassess)
 	routes.POST("/:id/review", middleware.RBAC(constants.RoleRPOReviewer, constants.RoleAdmin), target.Review)
 }

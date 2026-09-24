@@ -1,7 +1,11 @@
 export type DoseBand = 'within_admin' | 'above_admin' | 'near_legal' | 'above_legal' | 'invalid';
 export type QualityFlag = 'pending' | 'verified' | 'rejected';
 export type EntryType = 'confirmed' | 'reversal' | 'replacement';
-export type AssessmentStatus = 'calculated' | 'submitted' | 'accepted' | 'rejected';
+export type AssessmentStatus = 'calculated' | 'submitted' | 'accepted' | 'rejected' | 'superseded';
+export type FreshnessReasonCode =
+  | 'verified_exposure_records_changed'
+  | 'worker_limits_changed'
+  | 'exposure_records_and_limits_changed';
 
 export interface ExposureEntry {
   id: number;
@@ -45,6 +49,43 @@ export interface DoseEvidence {
   boundary_statement: string;
 }
 
+export interface FreshnessExposureChange {
+  entry_id: number;
+  source_ref: string;
+  occurred_at: string;
+  entry_type: EntryType;
+  change_kind: 'added' | 'removed';
+  dose_delta_msv: number;
+  correction_of_id?: number;
+}
+
+export interface FreshnessWorkerChange {
+  field: 'administrative_limit_msv' | 'annual_limit_msv' | string;
+  snapshot_value: number;
+  current_value: number;
+  change_kind: 'limit_changed';
+}
+
+export interface FreshnessReport {
+  checked_at: string;
+  fresh: boolean;
+  stale_reason_code?: FreshnessReasonCode;
+  stale_reason?: string;
+  snapshot_period_dose_msv: number;
+  current_period_dose_msv: number;
+  period_dose_delta_msv: number;
+  snapshot_admin_limit_msv: number;
+  current_admin_limit_msv: number;
+  snapshot_legal_limit_msv: number;
+  current_legal_limit_msv: number;
+  snapshot_worker_version: number;
+  current_worker_version: number;
+  exposure_changes: FreshnessExposureChange[];
+  worker_changes: FreshnessWorkerChange[];
+  new_excluded_entry_count: number;
+  new_excluded_entry_ids: number[];
+}
+
 export interface DoseBudgetAssessment {
   id: number;
   worker_id: number;
@@ -63,6 +104,7 @@ export interface DoseBudgetAssessment {
   threshold_version: string;
   plan_version: number;
   worker_version: number;
+  freshness?: FreshnessReport;
   created_at: string;
   reviewed_by?: number;
   reviewed_at?: string;

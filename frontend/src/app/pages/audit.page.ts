@@ -9,15 +9,17 @@ import { AuditApi } from '../api/audit.api';
 import { AuditEvent } from '../types/api';
 import { useBudgetAssessment } from '../hooks/use-budget-assessment';
 import { BudgetEvidencePanelComponent } from '../components/common/budget-evidence-panel.component';
+import { AssessmentFreshnessComponent } from '../components/common/assessment-freshness.component';
 import { DoseBandBadgeComponent } from '../components/common/dose-band-badge.component';
 import { SafetyBoundaryBannerComponent } from '../components/common/safety-boundary-banner.component';
 import { apiErrorMessage } from '../utils/api-error';
+import { DoseBudgetAssessment } from '../types/dose';
 
 @Component({
   standalone: true,
   imports: [
     CommonModule, ReactiveFormsModule, MatButtonModule, MatFormFieldModule, MatInputModule,
-    BudgetEvidencePanelComponent, DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
+    BudgetEvidencePanelComponent, AssessmentFreshnessComponent, DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
   ],
   template: `
     <div class="page">
@@ -37,14 +39,27 @@ import { apiErrorMessage } from '../utils/api-error';
         </aside>
         <section *ngIf="budget.selected() as selected" class="review-detail">
           <app-budget-evidence-panel [assessment]="selected" />
+          <app-assessment-freshness [report]="selected.freshness ?? null" />
           <form *ngIf="selected.assessment_status === 'submitted'" class="review-form" [formGroup]="form">
+            <div *ngIf="isStale(selected)" class="stale-bar">
+              <strong>Acceptance locked: snapshot outdated</strong>
+              <span>{{ staleReason(selected) }}</span>
+              <span>The planner must run a fresh reassessment on the budgets page. Rejecting the stale scenario stays available.</span>
+            </div>
             <mat-form-field appearance="outline"><mat-label>RPO review note</mat-label><textarea matInput rows="3" formControlName="note"></textarea></mat-form-field>
             <div>
               <button mat-button color="warn" type="button" [disabled]="form.invalid || saving()" (click)="review('reject')">Reject planning scenario</button>
-              <button mat-flat-button color="primary" type="button" [disabled]="form.invalid || saving()" (click)="review('accept')">Accept for planning</button>
+              <button mat-flat-button color="primary" type="button" [disabled]="form.invalid || saving() || isStale(selected)"
+                      [title]="isStale(selected) ? 'Reassessment required before acceptance' : 'Record planning acceptance'">
+                Accept for planning
+              </button>
             </div>
           </form>
-          <div *ngIf="selected.assessment_status !== 'submitted'" class="resolved">
+          <div *ngIf="selected.assessment_status === 'superseded'" class="resolved superseded">
+            <strong>superseded by a fresh assessment</strong>
+            <span>This immutable snapshot is retained for traceability but can no longer be reviewed.</span>
+          </div>
+          <div *ngIf="selected.assessment_status !== 'submitted' && selected.assessment_status !== 'superseded'" class="resolved">
             <strong>{{ selected.assessment_status.replaceAll('_', ' ') }}</strong>
             <span>{{ selected.review_note || 'No RPO disposition recorded.' }}</span>
           </div>
@@ -77,7 +92,10 @@ import { apiErrorMessage } from '../utils/api-error';
     .queue button span, .queue button small { display: block; } .queue button small { margin-top: 4px; color: var(--muted); font-size: 10px; }
     .review-form { display: grid; gap: 8px; margin-top: 10px; padding: 16px; background: #e8eeea; border: 1px solid var(--line); }
     .review-form div { display: flex; justify-content: flex-end; gap: 10px; }
+    .stale-bar { display: grid; gap: 4px; padding: 10px 12px; background: #f8dfde; border: 1px solid #d89591; color: #6d2a20; font-size: 11px; line-height: 1.45; }
+    .stale-bar strong { color: #8c2929; font-size: 12px; }
     .resolved { margin-top: 10px; padding: 14px; border: 1px solid var(--line); background: #f8f8f3; }
+    .resolved.superseded { border-color: #b6c2ba; background: #eef2ef; }
     .resolved strong { display: block; text-transform: capitalize; } .resolved span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
     .audit-table code { display: block; max-width: 360px; white-space: normal; overflow-wrap: anywhere; color: #34413e; font-size: 10px; }
     @media (max-width: 940px) { .review-layout { grid-template-columns: 1fr; } }
@@ -96,9 +114,21 @@ export class AuditPage implements OnInit {
 
   ngOnInit(): void { this.refresh(); }
 
+  isStale(assessment: DoseBudgetAssessment): boolean {
+    return assessment.assessment_status === 'submitted' && assessment.freshness?.fresh === false;
+  }
+
+  staleReason(assessment: DoseBudgetAssessment): string {
+    return assessment.freshness?.stale_reason ?? 'Assessment inputs changed after submission; reassess before accepting.';
+  }
+
   review(decision: 'accept' | 'reject'): void {
     const selected = this.budget.selected();
     if (!selected || this.form.invalid) return;
+    if (decision === 'accept' && this.isStale(selected)) {
+      this.error.set('Acceptance is blocked: the snapshot is outdated. Request a fresh reassessment.');
+      return;
+    }
     this.saving.set(true); this.error.set('');
     this.budget.review(selected.id, selected.plan_version, decision, this.form.controls.note.value)
       .pipe(finalize(() => this.saving.set(false))).subscribe({

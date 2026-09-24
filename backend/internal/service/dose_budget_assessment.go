@@ -63,26 +63,10 @@ func (service *DoseBudgetAssessmentService) Assess(
 		if plan.PermitStatus != constants.PermitStatusDraft && plan.PermitStatus != constants.PermitStatusAssessed {
 			return Conflict("invalid_state", "only draft or assessed plans can be assessed", nil)
 		}
-		worker, err := workers.FindForUpdate(plan.WorkerID)
-		if err != nil {
-			return MapRepositoryError("plan worker", err)
-		}
-		period, err := dosebudget.NewPeriod(worker.PeriodStart, request.PeriodEnd)
-		if err != nil {
-			return BadRequest("invalid_period", err.Error())
-		}
-		if request.PeriodEnd.After(time.Now().UTC().Add(5 * time.Minute)) {
-			return BadRequest("invalid_period", "period_end cannot be in the future")
-		}
-		periodEntries, err := entries.PeriodEntries(worker.ID, period.Start, period.End)
-		if err != nil {
-			return Internal("could not load period exposure entries", err)
-		}
-		assessment, err := service.calculate(plan, worker, period, periodEntries, actor.ID)
+		assessment, err := service.buildAssessment(tx, workers, entries, plan, request.PeriodEnd, actor.ID)
 		if err != nil {
 			return err
 		}
-		assessment.PlanVersion = plan.Version + 1
 		if err := assessments.Create(&assessment); err != nil {
 			return Internal("could not persist immutable assessment", err)
 		}
@@ -94,7 +78,7 @@ func (service *DoseBudgetAssessmentService) Assess(
 		plan.Version++
 		if err := service.audit.RecordTx(tx, actor, requestID, "assessment.calculated", "dose_budget_assessment", auditID(assessment.ID),
 			map[string]any{
-				"plan_id": plan.ID, "period_end": period.End, "threshold_version": service.thresholdVersion,
+				"plan_id": plan.ID, "period_end": request.PeriodEnd, "threshold_version": service.thresholdVersion,
 				"risk_band": assessment.RiskBand, "requires_human_review": true,
 			}, planAudit(beforePlan), map[string]any{
 				"assessment_id": assessment.ID, "plan_status": plan.PermitStatus, "plan_version": plan.Version,
@@ -102,13 +86,145 @@ func (service *DoseBudgetAssessmentService) Assess(
 			}); err != nil {
 			return err
 		}
+		worker, err := workers.Find(plan.WorkerID)
+		if err != nil {
+			return MapRepositoryError("plan worker", err)
+		}
 		response = assessmentResponse(assessment, plan, worker)
+		freshness, err := service.freshness(tx, assessment)
+		if err != nil {
+			return err
+		}
+		report := dto.FreshnessReportFrom(freshness)
+		response.Freshness = &report
 		return nil
 	})
 	if err != nil {
 		return dto.DoseBudgetAssessmentResponse{}, err
 	}
 	return response, nil
+}
+
+// Reassess supersedes an assessment currently awaiting RPO review with a fresh
+// immutable assessment. It exists for the staleness workflow: when exposure
+// records or worker limits drift while an assessment is in the review queue,
+// the planner replays the current inputs instead of forcing acceptance on a
+// stale snapshot. The superseded assessment is never deleted or rewritten.
+func (service *DoseBudgetAssessmentService) Reassess(
+	id uint,
+	request dto.ReassessDoseBudgetRequest,
+	actor dto.Actor,
+	requestID string,
+) (dto.DoseBudgetAssessmentResponse, error) {
+	var response dto.DoseBudgetAssessmentResponse
+	err := service.db.Transaction(func(tx *gorm.DB) error {
+		plans := service.plans.WithDB(tx)
+		workers := service.workers.WithDB(tx)
+		entries := service.entries.WithDB(tx)
+		assessments := service.assessments.WithDB(tx)
+		previous, err := assessments.FindForUpdate(id)
+		if err != nil {
+			return MapRepositoryError("dose budget assessment", err)
+		}
+		if previous.AssessmentStatus != constants.AssessmentStatusSubmitted {
+			return Conflict("invalid_state", "only assessments awaiting RPO review can be superseded by a reassessment", nil)
+		}
+		latest, err := assessments.LatestForPlan(previous.PlanID)
+		if err != nil || latest.ID != previous.ID {
+			return Conflict("stale_assessment", "only the latest assessment can be superseded", err)
+		}
+		plan, err := plans.FindForUpdate(previous.PlanID)
+		if err != nil {
+			return MapRepositoryError("assessment plan", err)
+		}
+		if plan.PermitStatus != constants.PermitStatusPendingRPOReview {
+			return Conflict("invalid_state", "assessment plan is not pending RPO review", nil)
+		}
+		if plan.Version != request.Version {
+			return Conflict("version_conflict", "plan changed before reassessment; refresh and recalculate", nil)
+		}
+		assessment, err := service.buildAssessment(tx, workers, entries, plan, request.PeriodEnd, actor.ID)
+		if err != nil {
+			return err
+		}
+		if err := assessments.Create(&assessment); err != nil {
+			return Internal("could not persist immutable reassessment", err)
+		}
+		if err := assessments.TransitionStatus(previous.ID, constants.AssessmentStatusSubmitted, constants.AssessmentStatusSuperseded); err != nil {
+			return Conflict("state_conflict", "assessment changed before it could be superseded", err)
+		}
+		if err := plans.Transition(plan.ID, plan.Version, constants.PermitStatusPendingRPOReview, constants.PermitStatusAssessed, map[string]any{}); err != nil {
+			return Conflict("version_conflict", "plan changed while the reassessment was being stored", err)
+		}
+		beforePlan := plan
+		previous.AssessmentStatus = constants.AssessmentStatusSuperseded
+		plan.PermitStatus = constants.PermitStatusAssessed
+		plan.Version++
+		if err := service.audit.RecordTx(tx, actor, requestID, "assessment.superseded", "dose_budget_assessment", auditID(previous.ID),
+			map[string]any{"superseded_by_assessment_id": assessment.ID, "plan_id": plan.ID, "reason": "freshness_reassessment"},
+			assessmentAudit(previous), assessmentAudit(assessment)); err != nil {
+			return err
+		}
+		if err := service.audit.RecordTx(tx, actor, requestID, "assessment.calculated", "dose_budget_assessment", auditID(assessment.ID),
+			map[string]any{
+				"plan_id": plan.ID, "period_end": request.PeriodEnd, "threshold_version": service.thresholdVersion,
+				"risk_band": assessment.RiskBand, "requires_human_review": true, "supersedes_assessment_id": previous.ID,
+			}, planAudit(beforePlan), map[string]any{
+				"assessment_id": assessment.ID, "plan_status": plan.PermitStatus, "plan_version": plan.Version,
+				"projected_dose_msv": assessment.ProjectedDoseMSV, "risk_band": assessment.RiskBand,
+			}); err != nil {
+			return err
+		}
+		worker, err := workers.Find(plan.WorkerID)
+		if err != nil {
+			return MapRepositoryError("plan worker", err)
+		}
+		response = assessmentResponse(assessment, plan, worker)
+		freshness, err := service.freshness(tx, assessment)
+		if err != nil {
+			return err
+		}
+		report := dto.FreshnessReportFrom(freshness)
+		response.Freshness = &report
+		return nil
+	})
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, err
+	}
+	return response, nil
+}
+
+// buildAssessment loads the worker and period entries under the current
+// transaction and calculates a new immutable assessment from current inputs.
+func (service *DoseBudgetAssessmentService) buildAssessment(
+	tx *gorm.DB,
+	workers *repository.WorkerProfileRepository,
+	entries *repository.ExposureEntryRepository,
+	plan model.WorkPermitPlan,
+	periodEnd time.Time,
+	createdBy uint,
+) (model.DoseBudgetAssessment, error) {
+	worker, err := workers.FindForUpdate(plan.WorkerID)
+	if err != nil {
+		return model.DoseBudgetAssessment{}, MapRepositoryError("plan worker", err)
+	}
+	period, err := dosebudget.NewPeriod(worker.PeriodStart, periodEnd)
+	if err != nil {
+		return model.DoseBudgetAssessment{}, BadRequest("invalid_period", err.Error())
+	}
+	if periodEnd.After(time.Now().UTC().Add(5 * time.Minute)) {
+		return model.DoseBudgetAssessment{}, BadRequest("invalid_period", "period_end cannot be in the future")
+	}
+	periodEntries, err := entries.PeriodEntries(worker.ID, period.Start, period.End)
+	if err != nil {
+		return model.DoseBudgetAssessment{}, Internal("could not load period exposure entries", err)
+	}
+	assessment, err := service.calculate(plan, worker, period, periodEntries, createdBy)
+	if err != nil {
+		return model.DoseBudgetAssessment{}, err
+	}
+	assessment.PlanVersion = plan.Version + 1
+	return assessment, nil
 }
 
 func (service *DoseBudgetAssessmentService) Compare(
@@ -211,6 +327,12 @@ func (service *DoseBudgetAssessmentService) Submit(
 			return MapRepositoryError("assessment worker", err)
 		}
 		response = assessmentResponse(assessment, plan, worker)
+		freshness, err := service.freshness(tx, assessment)
+		if err != nil {
+			return err
+		}
+		report := dto.FreshnessReportFrom(freshness)
+		response.Freshness = &report
 		return nil
 	})
 	if err != nil {
@@ -249,6 +371,31 @@ func (service *DoseBudgetAssessmentService) Review(
 		targetPlanStatus := constants.PermitStatusRejected
 		targetAssessmentStatus := constants.AssessmentStatusRejected
 		if request.Decision == "accept" {
+			// Acceptance can only rest on evidence that still matches the current
+			// ledger and limits. Lock the worker so the replay cannot interleave
+			// with a concurrent limit adjustment. Rejecting a stale scenario stays
+			// available so the planner is never blocked from producing a fresh assessment.
+			if _, err := service.workers.WithDB(tx).FindForUpdate(assessment.WorkerID); err != nil {
+				return MapRepositoryError("assessment worker", err)
+			}
+			freshness, err := service.freshness(tx, assessment)
+			if err != nil {
+				return err
+			}
+			if !freshness.Fresh {
+				return ConflictDetails("stale_assessment_inputs",
+					"assessment inputs changed after submission; a fresh assessment is required before acceptance",
+					map[string]any{
+						"stale_reason_code": freshness.StaleReasonCode, "stale_reason": freshness.StaleReason,
+						"period_dose_delta_msv":    freshness.PeriodDoseDeltaMSV,
+						"snapshot_period_dose_msv": freshness.SnapshotPeriodDoseMSV,
+						"current_period_dose_msv":  freshness.CurrentPeriodDoseMSV,
+						"exposure_change_count":    len(freshness.ExposureChanges),
+						"worker_change_count":      len(freshness.WorkerChanges),
+						"exposure_changes":         freshness.ExposureChanges,
+						"worker_changes":           freshness.WorkerChanges,
+					})
+			}
 			targetPlanStatus = constants.PermitStatusPlanningAccepted
 			targetAssessmentStatus = constants.AssessmentStatusAccepted
 		}
@@ -287,6 +434,12 @@ func (service *DoseBudgetAssessmentService) Review(
 			return MapRepositoryError("assessment worker", err)
 		}
 		response = assessmentResponse(assessment, plan, worker)
+		freshness, err := service.freshness(tx, assessment)
+		if err != nil {
+			return err
+		}
+		report := dto.FreshnessReportFrom(freshness)
+		response.Freshness = &report
 		return nil
 	})
 	if err != nil {
@@ -308,7 +461,14 @@ func (service *DoseBudgetAssessmentService) Get(id uint) (dto.DoseBudgetAssessme
 	if err != nil {
 		return dto.DoseBudgetAssessmentResponse{}, MapRepositoryError("assessment worker", err)
 	}
-	return assessmentResponse(assessment, plan, worker), nil
+	response := assessmentResponse(assessment, plan, worker)
+	freshness, err := service.freshness(service.db, assessment)
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, err
+	}
+	report := dto.FreshnessReportFrom(freshness)
+	response.Freshness = &report
+	return response, nil
 }
 
 func (service *DoseBudgetAssessmentService) List(
@@ -337,9 +497,50 @@ func (service *DoseBudgetAssessmentService) List(
 		if err != nil {
 			return nil, dto.PageMeta{}, MapRepositoryError("assessment worker", err)
 		}
-		responses = append(responses, assessmentResponse(assessment, plan, worker))
+		response := assessmentResponse(assessment, plan, worker)
+		freshness, err := service.freshness(service.db, assessment)
+		if err != nil {
+			return nil, dto.PageMeta{}, err
+		}
+		report := dto.FreshnessReportFrom(freshness)
+		response.Freshness = &report
+		responses = append(responses, response)
 	}
 	return responses, pageMeta(page, pageSize, total), nil
+}
+
+// freshness replays a stored assessment snapshot against the current worker
+// profile and exposure ledger. It is read-only: the immutable assessment row
+// is never rewritten, so old snapshots stay fully reproducible.
+func (service *DoseBudgetAssessmentService) freshness(handle *gorm.DB, assessment model.DoseBudgetAssessment) (dosebudget.Freshness, error) {
+	var snapshot dosebudget.Snapshot
+	if err := json.Unmarshal([]byte(assessment.InputSnapshotJSON), &snapshot); err != nil {
+		return dosebudget.Freshness{}, Internal("stored assessment snapshot is invalid", err)
+	}
+	worker, err := service.workers.WithDB(handle).Find(assessment.WorkerID)
+	if err != nil {
+		return dosebudget.Freshness{}, MapRepositoryError("assessment worker", err)
+	}
+	entries, err := service.entries.WithDB(handle).PeriodEntries(worker.ID, snapshot.PeriodStart, snapshot.PeriodEnd)
+	if err != nil {
+		return dosebudget.Freshness{}, Internal("could not load period exposure entries", err)
+	}
+	likes := make([]dosebudget.ExposureEntryLike, 0, len(entries))
+	for _, entry := range entries {
+		likes = append(likes, dosebudget.ExposureEntryLike{
+			ID: entry.ID, SourceRef: entry.SourceRef, OccurredAt: entry.OccurredAt, DoseMSV: entry.DoseMSV,
+			EntryType: entry.EntryType, QualityFlag: entry.QualityFlag, CorrectionOfID: entry.CorrectionOfID,
+		})
+	}
+	return dosebudget.EvaluateFreshness(
+		dosebudget.FreshnessSnapshotInputs{
+			PeriodStart: snapshot.PeriodStart, PeriodEnd: snapshot.PeriodEnd, PeriodDoseMSV: assessment.PeriodDoseMSV,
+			AdminLimitMSV: snapshot.AdministrativeLimitMSV, LegalLimitMSV: snapshot.LegalLimitMSV,
+			WorkerVersion: snapshot.WorkerVersion, IncludedExposureIDs: snapshot.IncludedExposureIDs,
+			ExcludedExposureIDs: snapshot.ExcludedExposureIDs,
+		},
+		likes, worker.AdministrativeLimitMSV, worker.AnnualLimitMSV, worker.Version, time.Now().UTC(),
+	), nil
 }
 
 func (service *DoseBudgetAssessmentService) calculate(

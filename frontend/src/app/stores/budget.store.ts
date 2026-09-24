@@ -38,6 +38,16 @@ export class BudgetStore {
     return this.api.submit(id, version).pipe(tap(response => this.replace(response.data)));
   }
 
+  reassess(id: number, periodEnd: string, version: number) {
+    return this.api.reassess(id, periodEnd, version).pipe(tap(response => {
+      this.assessments.update(items => items.map(item =>
+        item.id === id ? { ...item, assessment_status: 'superseded' as const } : item,
+      ));
+      this.assessments.update(items => [response.data, ...items]);
+      this.selected.set(response.data);
+    }));
+  }
+
   review(id: number, version: number, decision: 'accept' | 'reject', note: string) {
     return this.api.review(id, version, decision, note).pipe(tap(response => this.replace(response.data)));
   }

@@ -21,6 +21,7 @@ const (
 	AssessmentStatusSubmitted  = "submitted"
 	AssessmentStatusAccepted   = "accepted"
 	AssessmentStatusRejected   = "rejected"
+	AssessmentStatusSuperseded = "superseded"
 )
 
 const (

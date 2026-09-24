@@ -80,13 +80,13 @@ plan_version="$(jq -r '.data.version' <<<"$last_body")"
 request "create comparison plan" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$worker_id" '{plan_code:"QA-ALARA-530-LO",worker_id:$worker,work_area:"QA controlled bay",task_category:"Remote survey",estimated_rate_msvh:0.1,planned_minutes:30,controls:["distance markers","remote reading"]}')"
 comparison_plan_id="$(jq -r '.data.id' <<<"$last_body")"
 
-period_end="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg end "$period_end" '{plan_id:$plan,period_end:$end,version:$version}')"
+period_end="$(date -u -d '@'$(( $(date -u +%s) + 1 )) +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v+1S +'%Y-%m-%dT%H:%M:%SZ')"
+request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg periodEnd "$period_end" '{plan_id:$plan,period_end:$periodEnd,version:$version}')"
 assessment_id="$(jq -r '.data.id' <<<"$last_body")"
 assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
 require_json '.data.period_dose_msv == 0.3 and .data.projected_dose_msv == 1.8 and .data.risk_band == "above_legal" and .data.evidence.requires_manual_review == true' "corrected total, projection and threshold escalation"
 
-request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg end "$period_end" '{plan_ids:[$first,$second],period_end:$end}')"
+request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg periodEnd "$period_end" '{plan_ids:[$first,$second],period_end:$periodEnd}')"
 require_json '.data.scenarios | length == 2' "two comparison scenarios"
 
 request "submit assessment to RPO" 200 POST "/assessments/$assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$assessed_version" '{version:$version}')"
@@ -105,5 +105,51 @@ require_json '(.data | length) >= 8 and ([.data[].action] | index("assessment.re
 
 request "worker total reflects correction" 200 GET "/workers/$worker_id" "$admin_token"
 require_json '.data.period_dose_msv == 0.3' "period total uses original plus reversal plus replacement"
+
+# Freshness gate: a verified record arriving after submission must lock acceptance
+# until the planner supersedes the stale snapshot with a fresh reassessment.
+request "create freshness test worker" 201 POST "/workers" "$planner_token" '{"worker_code":"FR-531","display_name":"Freshness QA","authorization_level":"L1","annual_limit_msv":2,"administrative_limit_msv":1,"profile_status":"active","period_start":"2026-01-01T00:00:00Z"}'
+fresh_worker_id="$(jq -r '.data.id' <<<"$last_body")"
+
+fresh_occurred="$(date -u -d '@'$(( $(date -u +%s) - 60 )) +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v-60S +'%Y-%m-%dT%H:%M:%SZ')"
+request "create first verified period record" 201 POST "/exposures" "$planner_token" "$(jq -nc --argjson worker "$fresh_worker_id" --arg at "$fresh_occurred" '{worker_id:$worker,source_ref:"FR-531-A",occurred_at:$at,dose_msv:0.1,note:"first"}')"
+first_exposure_id="$(jq -r '.data.id' <<<"$last_body")"
+request "RPO verifies first record" 200 POST "/exposures/$first_exposure_id/verify" "$rpo_token" '{"quality_flag":"verified","note":"verified first"}'
+
+request "create freshness plan" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$fresh_worker_id" '{plan_code:"FR-531-PLAN",worker_id:$worker,work_area:"QA bay",task_category:"Freshness check",estimated_rate_msvh:0.05,planned_minutes:60,controls:["time limit"]}')"
+fresh_plan_id="$(jq -r '.data.id' <<<"$last_body")"
+fresh_plan_version="$(jq -r '.data.version' <<<"$last_body")"
+
+fresh_period_end="$(date -u -d '@'$(( $(date -u +%s) + 1 )) +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v+1S +'%Y-%m-%dT%H:%M:%SZ')"
+request "calculate freshness baseline assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$fresh_plan_id" --argjson version "$fresh_plan_version" --arg periodEnd "$fresh_period_end" '{plan_id:$plan,period_end:$periodEnd,version:$version}')"
+fresh_assessment_id="$(jq -r '.data.id' <<<"$last_body")"
+fresh_assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+require_json '.data.period_dose_msv == 0.1 and .data.freshness.fresh == true' "baseline assessment starts fresh"
+
+request "submit freshness assessment" 200 POST "/assessments/$fresh_assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$fresh_assessed_version" '{version:$version}')"
+fresh_review_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+
+request "create late verified period record" 201 POST "/exposures" "$planner_token" "$(jq -nc --argjson worker "$fresh_worker_id" --arg at "$fresh_occurred" '{worker_id:$worker,source_ref:"FR-531-B",occurred_at:$at,dose_msv:0.2,note:"arrives after submission"}')"
+late_exposure_id="$(jq -r '.data.id' <<<"$last_body")"
+request "RPO verifies late record" 200 POST "/exposures/$late_exposure_id/verify" "$rpo_token" '{"quality_flag":"verified","note":"verified late"}'
+
+request "detail now reports stale snapshot" 200 GET "/assessments/$fresh_assessment_id" "$rpo_token"
+require_json '.data.freshness.fresh == false and .data.freshness.stale_reason_code == "verified_exposure_records_changed" and .data.freshness.period_dose_delta_msv == 0.2 and (.data.freshness.exposure_changes | length) == 1' "stale detail lists changed record and net dose delta"
+
+request "stale snapshot blocks RPO acceptance" 409 POST "/assessments/$fresh_assessment_id/review" "$rpo_token" "$(jq -nc --argjson version "$fresh_review_version" '{version:$version,decision:"accept",note:"must be blocked while stale"}')"
+require_json '.error.code == "stale_assessment_inputs" and .error.details.stale_reason_code == "verified_exposure_records_changed"' "acceptance conflict carries explicit stale reason"
+
+request "planner supersedes stale snapshot" 201 POST "/assessments/$fresh_assessment_id/reassess" "$planner_token" "$(jq -nc --argjson version "$fresh_review_version" --arg periodEnd "$fresh_period_end" '{period_end:$periodEnd,version:$version}')"
+new_assessment_id="$(jq -r '.data.id' <<<"$last_body")"
+new_assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+require_json ".data.id != $fresh_assessment_id and .data.period_dose_msv == 0.3 and .data.assessment_status == \"calculated\" and .data.freshness.fresh == true" "reassessment recomputes from current ledger and is fresh"
+
+request "old snapshot retained as superseded" 200 GET "/assessments/$fresh_assessment_id" "$planner_token"
+require_json '.data.assessment_status == "superseded" and .data.period_dose_msv == 0.1' "superseded snapshot stays traceable at old values"
+
+request "submit fresh reassessment" 200 POST "/assessments/$new_assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$new_assessed_version" '{version:$version}')"
+new_review_version="$(jq -r '.data.plan_version' <<<"$last_body")"
+request "accept fresh reassessment" 200 POST "/assessments/$new_assessment_id/review" "$rpo_token" "$(jq -nc --argjson version "$new_review_version" '{version:$version,decision:"accept",note:"fresh evidence accepted for planning"}')"
+require_json '.data.assessment_status == "accepted" and .data.freshness.fresh == true' "fresh reassessment reaches normal acceptance"
 
 printf 'ALL %d API CHECKS PASSED\n' "$checks"

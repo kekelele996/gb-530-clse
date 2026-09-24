@@ -18,6 +18,9 @@ export class AssessmentsApi {
   submit(id: number, version: number) {
     return this.http.post<ApiEnvelope<DoseBudgetAssessment>>(`${this.root}/${id}/submit`, { version });
   }
+  reassess(id: number, periodEnd: string, version: number) {
+    return this.http.post<ApiEnvelope<DoseBudgetAssessment>>(`${this.root}/${id}/reassess`, { period_end: periodEnd, version });
+  }
   review(id: number, version: number, decision: 'accept' | 'reject', note: string) {
     return this.http.post<ApiEnvelope<DoseBudgetAssessment>>(`${this.root}/${id}/review`, { version, decision, note });
   }
