@@ -16,10 +16,15 @@ type PeriodSummary struct {
 	CorrectedChainCount int
 	IncludedEntryIDs    []uint
 	ExcludedEntryIDs    []uint
+	ExcludedQualities   map[uint]string
 }
 
 func SummarizeEntries(entries []model.ExposureEntry) (PeriodSummary, error) {
-	result := PeriodSummary{IncludedEntryIDs: []uint{}, ExcludedEntryIDs: []uint{}}
+	result := PeriodSummary{
+		IncludedEntryIDs:  []uint{},
+		ExcludedEntryIDs:  []uint{},
+		ExcludedQualities: map[uint]string{},
+	}
 	byID := make(map[uint]model.ExposureEntry, len(entries))
 	sources := make(map[string]uint, len(entries))
 	for _, entry := range entries {
@@ -39,6 +44,7 @@ func SummarizeEntries(entries []model.ExposureEntry) (PeriodSummary, error) {
 		if entry.QualityFlag != constants.QualityFlagVerified {
 			result.ExcludedEntryCount++
 			result.ExcludedEntryIDs = append(result.ExcludedEntryIDs, entry.ID)
+			result.ExcludedQualities[entry.ID] = entry.QualityFlag
 			continue
 		}
 		if entry.EntryType == constants.EntryTypeConfirmed && entry.DoseMSV < 0 {

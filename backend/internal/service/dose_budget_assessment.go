@@ -102,7 +102,10 @@ func (service *DoseBudgetAssessmentService) Assess(
 			}); err != nil {
 			return err
 		}
-		response = assessmentResponse(assessment, plan, worker)
+		response, err = service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
+		if err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -170,6 +173,7 @@ func (service *DoseBudgetAssessmentService) Submit(
 	err := service.db.Transaction(func(tx *gorm.DB) error {
 		assessments := service.assessments.WithDB(tx)
 		plans := service.plans.WithDB(tx)
+		entries := service.entries.WithDB(tx)
 		assessment, err := assessments.FindForUpdate(id)
 		if err != nil {
 			return MapRepositoryError("dose budget assessment", err)
@@ -210,8 +214,16 @@ func (service *DoseBudgetAssessmentService) Submit(
 		if err != nil {
 			return MapRepositoryError("assessment worker", err)
 		}
-		response = assessmentResponse(assessment, plan, worker)
-		return nil
+		periodStart, periodEnd, err := snapshotPeriod(assessment)
+		if err != nil {
+			return Internal("stored assessment snapshot is invalid", err)
+		}
+		periodEntries, err := entries.PeriodEntries(worker.ID, periodStart, periodEnd)
+		if err != nil {
+			return Internal("could not replay period exposure entries", err)
+		}
+		response, err = service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
+		return err
 	})
 	if err != nil {
 		return dto.DoseBudgetAssessmentResponse{}, err
@@ -229,6 +241,8 @@ func (service *DoseBudgetAssessmentService) Review(
 	err := service.db.Transaction(func(tx *gorm.DB) error {
 		assessments := service.assessments.WithDB(tx)
 		plans := service.plans.WithDB(tx)
+		workers := service.workers.WithDB(tx)
+		entries := service.entries.WithDB(tx)
 		assessment, err := assessments.FindForUpdate(id)
 		if err != nil {
 			return MapRepositoryError("dose budget assessment", err)
@@ -245,6 +259,25 @@ func (service *DoseBudgetAssessmentService) Review(
 		}
 		if plan.PermitStatus != constants.PermitStatusPendingRPOReview {
 			return Conflict("invalid_state", "plan is not pending RPO review", nil)
+		}
+		worker, err := workers.FindForUpdate(plan.WorkerID)
+		if err != nil {
+			return MapRepositoryError("assessment worker", err)
+		}
+		periodStart, periodEnd, err := snapshotPeriod(assessment)
+		if err != nil {
+			return Internal("stored assessment snapshot is invalid", err)
+		}
+		periodEntries, err := entries.PeriodEntries(worker.ID, periodStart, periodEnd)
+		if err != nil {
+			return Internal("could not replay period exposure entries", err)
+		}
+		freshness, err := service.buildFreshness(&assessment, &worker, periodEntries)
+		if err != nil {
+			return Internal("could not verify assessment snapshot freshness", err)
+		}
+		if request.Decision == "accept" && !freshness.IsFresh {
+			return Conflict("stale_snapshot", freshness.StaleMessage(), nil)
 		}
 		targetPlanStatus := constants.PermitStatusRejected
 		targetAssessmentStatus := constants.AssessmentStatusRejected
@@ -276,18 +309,95 @@ func (service *DoseBudgetAssessmentService) Review(
 			map[string]any{
 				"decision": request.Decision, "expected_plan_version": request.Version,
 				"review_note_length": len(strings.TrimSpace(request.Note)), "planning_only": true,
+				"snapshot_fresh": freshness.IsFresh, "freshness_reason_codes": freshness.ReasonCodes,
 			}, planAudit(beforePlan), map[string]any{
 				"assessment_status": targetAssessmentStatus, "plan_status": targetPlanStatus,
 				"plan_version": plan.Version, "planning_acceptance_is_not_work_permit": true,
 			}); err != nil {
 			return err
 		}
-		worker, err := service.workers.WithDB(tx).Find(plan.WorkerID)
+		response, err = service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
+		return err
+	})
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, err
+	}
+	return response, nil
+}
+
+// ReturnForReassessment sends a submitted assessment back to planning because its frozen
+// snapshot no longer matches current exposure records or worker limits. The old snapshot
+// stays traceable; the planner runs a new assessment and resubmits through the normal flow.
+func (service *DoseBudgetAssessmentService) ReturnForReassessment(
+	id uint,
+	request dto.PlanVersionRequest,
+	actor dto.Actor,
+	requestID string,
+) (dto.DoseBudgetAssessmentResponse, error) {
+	var response dto.DoseBudgetAssessmentResponse
+	err := service.db.Transaction(func(tx *gorm.DB) error {
+		assessments := service.assessments.WithDB(tx)
+		plans := service.plans.WithDB(tx)
+		workers := service.workers.WithDB(tx)
+		entries := service.entries.WithDB(tx)
+		assessment, err := assessments.FindForUpdate(id)
+		if err != nil {
+			return MapRepositoryError("dose budget assessment", err)
+		}
+		if assessment.AssessmentStatus != constants.AssessmentStatusSubmitted {
+			return Conflict("invalid_state", "only submitted assessments can be returned for reassessment", nil)
+		}
+		plan, err := plans.FindForUpdate(assessment.PlanID)
+		if err != nil {
+			return MapRepositoryError("assessment plan", err)
+		}
+		if plan.Version != request.Version {
+			return Conflict("version_conflict", "plan changed before return for reassessment", nil)
+		}
+		if plan.PermitStatus != constants.PermitStatusPendingRPOReview {
+			return Conflict("invalid_state", "plan is not pending RPO review", nil)
+		}
+		worker, err := workers.FindForUpdate(plan.WorkerID)
 		if err != nil {
 			return MapRepositoryError("assessment worker", err)
 		}
-		response = assessmentResponse(assessment, plan, worker)
-		return nil
+		periodStart, periodEnd, err := snapshotPeriod(assessment)
+		if err != nil {
+			return Internal("stored assessment snapshot is invalid", err)
+		}
+		periodEntries, err := entries.PeriodEntries(worker.ID, periodStart, periodEnd)
+		if err != nil {
+			return Internal("could not replay period exposure entries", err)
+		}
+		freshness, err := service.buildFreshness(&assessment, &worker, periodEntries)
+		if err != nil {
+			return Internal("could not verify assessment snapshot freshness", err)
+		}
+		if freshness.IsFresh {
+			return Conflict("fresh_snapshot", "assessment inputs still match the snapshot; reject the planning scenario instead of returning it", nil)
+		}
+		if err := assessments.TransitionStatus(id, constants.AssessmentStatusSubmitted, constants.AssessmentStatusReturned); err != nil {
+			return Conflict("state_conflict", "assessment changed before return for reassessment", err)
+		}
+		if err := plans.Transition(plan.ID, plan.Version, constants.PermitStatusPendingRPOReview, constants.PermitStatusAssessed, map[string]any{}); err != nil {
+			return Conflict("version_conflict", "plan changed before the return was committed", err)
+		}
+		beforePlan := plan
+		plan.PermitStatus = constants.PermitStatusAssessed
+		plan.Version++
+		assessment.AssessmentStatus = constants.AssessmentStatusReturned
+		if err := service.audit.RecordTx(tx, actor, requestID, "assessment.returned_for_reassessment", "dose_budget_assessment", auditID(id),
+			map[string]any{
+				"expected_plan_version": request.Version, "freshness_reason_codes": freshness.ReasonCodes,
+				"period_dose_delta_msv": freshness.PeriodDoseDeltaMSV, "stale_reasons": freshness.Reasons,
+			}, planAudit(beforePlan), map[string]any{
+				"assessment_status": constants.AssessmentStatusReturned, "plan_status": plan.PermitStatus,
+				"plan_version": plan.Version, "prior_snapshot_retained": true,
+			}); err != nil {
+			return err
+		}
+		response, err = service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
+		return err
 	})
 	if err != nil {
 		return dto.DoseBudgetAssessmentResponse{}, err
@@ -308,7 +418,15 @@ func (service *DoseBudgetAssessmentService) Get(id uint) (dto.DoseBudgetAssessme
 	if err != nil {
 		return dto.DoseBudgetAssessmentResponse{}, MapRepositoryError("assessment worker", err)
 	}
-	return assessmentResponse(assessment, plan, worker), nil
+	periodStart, periodEnd, err := snapshotPeriod(assessment)
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, Internal("stored assessment snapshot is invalid", err)
+	}
+	periodEntries, err := service.entries.PeriodEntries(worker.ID, periodStart, periodEnd)
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, Internal("could not replay period exposure entries", err)
+	}
+	return service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
 }
 
 func (service *DoseBudgetAssessmentService) List(
@@ -337,7 +455,19 @@ func (service *DoseBudgetAssessmentService) List(
 		if err != nil {
 			return nil, dto.PageMeta{}, MapRepositoryError("assessment worker", err)
 		}
-		responses = append(responses, assessmentResponse(assessment, plan, worker))
+		periodStart, periodEnd, err := snapshotPeriod(assessment)
+		if err != nil {
+			return nil, dto.PageMeta{}, Internal("stored assessment snapshot is invalid", err)
+		}
+		periodEntries, err := service.entries.PeriodEntries(worker.ID, periodStart, periodEnd)
+		if err != nil {
+			return nil, dto.PageMeta{}, Internal("could not replay period exposure entries", err)
+		}
+		response, err := service.attachFreshness(assessmentResponse(assessment, plan, worker), &assessment, &worker, periodEntries)
+		if err != nil {
+			return nil, dto.PageMeta{}, err
+		}
+		responses = append(responses, response)
 	}
 	return responses, pageMeta(page, pageSize, total), nil
 }
@@ -408,6 +538,76 @@ func assessmentResponse(
 		RiskBand: assessment.RiskBand, Evidence: evidence, ThresholdVersion: assessment.ThresholdVersion,
 		PlanVersion: plan.Version, WorkerVersion: assessment.WorkerVersion, CreatedAt: assessment.CreatedAt,
 		ReviewedBy: assessment.ReviewedBy, ReviewedAt: assessment.ReviewedAt, ReviewNote: assessment.ReviewNote,
+	}
+}
+
+func snapshotPeriod(assessment model.DoseBudgetAssessment) (time.Time, time.Time, error) {
+	snapshot := dosebudget.Snapshot{}
+	if err := json.Unmarshal([]byte(assessment.InputSnapshotJSON), &snapshot); err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if snapshot.PeriodStart.IsZero() || snapshot.PeriodEnd.IsZero() {
+		return time.Time{}, time.Time{}, fmt.Errorf("snapshot is missing the assessment period")
+	}
+	return snapshot.PeriodStart.UTC(), snapshot.PeriodEnd.UTC(), nil
+}
+
+// buildFreshness replays the frozen snapshot period against current storage state.
+func (service *DoseBudgetAssessmentService) buildFreshness(
+	assessment *model.DoseBudgetAssessment,
+	worker *model.WorkerProfile,
+	entries []model.ExposureEntry,
+) (dosebudget.FreshnessReport, error) {
+	snapshot := dosebudget.Snapshot{}
+	if err := json.Unmarshal([]byte(assessment.InputSnapshotJSON), &snapshot); err != nil {
+		return dosebudget.FreshnessReport{}, fmt.Errorf("decode assessment snapshot: %w", err)
+	}
+	report, err := dosebudget.BuildFreshness(snapshot, assessment.PeriodDoseMSV, worker.Version,
+		worker.AdministrativeLimitMSV, worker.AnnualLimitMSV, service.nearRatio, service.thresholdVersion,
+		entries, time.Now().UTC())
+	if err != nil {
+		return dosebudget.FreshnessReport{}, err
+	}
+	return report, nil
+}
+
+func (service *DoseBudgetAssessmentService) attachFreshness(
+	response dto.DoseBudgetAssessmentResponse,
+	assessment *model.DoseBudgetAssessment,
+	worker *model.WorkerProfile,
+	entries []model.ExposureEntry,
+) (dto.DoseBudgetAssessmentResponse, error) {
+	report, err := service.buildFreshness(assessment, worker, entries)
+	if err != nil {
+		return dto.DoseBudgetAssessmentResponse{}, Internal("could not evaluate assessment freshness", err)
+	}
+	response.Freshness = freshnessResponse(report)
+	return response, nil
+}
+
+func freshnessResponse(report dosebudget.FreshnessReport) *dto.AssessmentFreshness {
+	entryChanges := make([]dto.AssessmentFreshnessEntryChange, 0, len(report.EntryChanges))
+	for _, change := range report.EntryChanges {
+		entryChanges = append(entryChanges, dto.AssessmentFreshnessEntryChange{
+			EntryID: change.EntryID, SourceRef: change.SourceRef, ChangeType: change.ChangeType,
+			QualityFlag: change.QualityFlag, DoseMSV: change.DoseMSV, OccurredAt: change.OccurredAt,
+			SnapshotState: change.SnapshotState, CurrentState: change.CurrentState,
+		})
+	}
+	limitChanges := make([]dto.AssessmentFreshnessLimitChange, 0, len(report.LimitChanges))
+	for _, change := range report.LimitChanges {
+		limitChanges = append(limitChanges, dto.AssessmentFreshnessLimitChange{
+			LimitName: change.LimitName, ChangeType: change.ChangeType,
+			SnapshotMSV: change.SnapshotMSV, CurrentMSV: change.CurrentMSV,
+		})
+	}
+	return &dto.AssessmentFreshness{
+		IsFresh: report.IsFresh, CheckedAt: report.CheckedAt,
+		SnapshotWorkerVersion: report.SnapshotWorkerVersion, CurrentWorkerVersion: report.CurrentWorkerVersion,
+		SnapshotPeriodDoseMSV: report.SnapshotPeriodDoseMSV, CurrentPeriodDoseMSV: report.CurrentPeriodDoseMSV,
+		PeriodDoseDeltaMSV: report.PeriodDoseDeltaMSV, EntryChanges: entryChanges, LimitChanges: limitChanges,
+		ThresholdChanged: report.ThresholdChanged, SnapshotThreshold: report.SnapshotThreshold,
+		CurrentThreshold: report.CurrentThreshold, ReasonCodes: report.ReasonCodes, Reasons: report.Reasons,
 	}
 }
 

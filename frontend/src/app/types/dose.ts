@@ -1,7 +1,7 @@
 export type DoseBand = 'within_admin' | 'above_admin' | 'near_legal' | 'above_legal' | 'invalid';
 export type QualityFlag = 'pending' | 'verified' | 'rejected';
 export type EntryType = 'confirmed' | 'reversal' | 'replacement';
-export type AssessmentStatus = 'calculated' | 'submitted' | 'accepted' | 'rejected';
+export type AssessmentStatus = 'calculated' | 'submitted' | 'returned' | 'accepted' | 'rejected';
 
 export interface ExposureEntry {
   id: number;
@@ -45,6 +45,41 @@ export interface DoseEvidence {
   boundary_statement: string;
 }
 
+export interface AssessmentFreshnessEntryChange {
+  entry_id: number;
+  source_ref: string;
+  change_type: 'entry_added' | 'entry_removed' | 'entry_quality_changed';
+  quality_flag: QualityFlag | '';
+  dose_msv: number;
+  occurred_at: string;
+  snapshot_state: string;
+  current_state: string;
+}
+
+export interface AssessmentFreshnessLimitChange {
+  limit_name: 'administrative_limit_msv' | 'annual_legal_limit_msv';
+  change_type: 'administrative_limit_changed' | 'legal_limit_changed';
+  snapshot_msv: number;
+  current_msv: number;
+}
+
+export interface AssessmentFreshness {
+  is_fresh: boolean;
+  checked_at: string;
+  snapshot_worker_version: number;
+  current_worker_version: number;
+  snapshot_period_dose_msv: number;
+  current_period_dose_msv: number;
+  period_dose_delta_msv: number;
+  entry_changes: AssessmentFreshnessEntryChange[];
+  limit_changes: AssessmentFreshnessLimitChange[];
+  threshold_changed: boolean;
+  snapshot_threshold_version: string;
+  current_threshold_version: string;
+  reason_codes: string[];
+  reasons: string[];
+}
+
 export interface DoseBudgetAssessment {
   id: number;
   worker_id: number;
@@ -63,6 +98,7 @@ export interface DoseBudgetAssessment {
   threshold_version: string;
   plan_version: number;
   worker_version: number;
+  freshness?: AssessmentFreshness;
   created_at: string;
   reviewed_by?: number;
   reviewed_at?: string;

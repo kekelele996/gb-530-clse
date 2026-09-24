@@ -31,7 +31,7 @@ func CanTransitionPermit(from, to string) bool {
 	allowed := map[string]map[string]bool{
 		PermitStatusDraft:            {PermitStatusAssessed: true},
 		PermitStatusAssessed:         {PermitStatusAssessed: true, PermitStatusPendingRPOReview: true},
-		PermitStatusPendingRPOReview: {PermitStatusPlanningAccepted: true, PermitStatusRejected: true},
+		PermitStatusPendingRPOReview: {PermitStatusPlanningAccepted: true, PermitStatusRejected: true, PermitStatusAssessed: true},
 		PermitStatusPlanningAccepted: {PermitStatusArchived: true},
 		PermitStatusRejected:         {PermitStatusArchived: true},
 	}

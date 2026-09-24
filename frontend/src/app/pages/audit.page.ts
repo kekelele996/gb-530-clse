@@ -7,17 +7,21 @@ import { MatInputModule } from '@angular/material/input';
 import { finalize } from 'rxjs';
 import { AuditApi } from '../api/audit.api';
 import { AuditEvent } from '../types/api';
+import { HttpErrorResponse } from '@angular/common/http';
 import { useBudgetAssessment } from '../hooks/use-budget-assessment';
 import { BudgetEvidencePanelComponent } from '../components/common/budget-evidence-panel.component';
+import { AssessmentFreshnessPanelComponent } from '../components/common/assessment-freshness-panel.component';
 import { DoseBandBadgeComponent } from '../components/common/dose-band-badge.component';
 import { SafetyBoundaryBannerComponent } from '../components/common/safety-boundary-banner.component';
 import { apiErrorMessage } from '../utils/api-error';
+import { DoseBudgetAssessment } from '../types/dose';
 
 @Component({
   standalone: true,
   imports: [
     CommonModule, ReactiveFormsModule, MatButtonModule, MatFormFieldModule, MatInputModule,
-    BudgetEvidencePanelComponent, DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
+    BudgetEvidencePanelComponent, AssessmentFreshnessPanelComponent,
+    DoseBandBadgeComponent, SafetyBoundaryBannerComponent,
   ],
   template: `
     <div class="page">
@@ -31,17 +35,31 @@ import { apiErrorMessage } from '../utils/api-error';
           <header><h2>Review queue</h2><span>{{ pending().length }} pending</span></header>
           <button *ngFor="let item of pending()" type="button" [class.active]="budget.selected()?.id === item.id" (click)="budget.select(item)">
             <span><strong>{{ item.plan_code }}</strong><small>{{ item.worker_code }} · assessment #{{ item.id }}</small></span>
-            <app-dose-band-badge [band]="item.risk_band" />
+            <span class="queue-badges">
+              <em class="stale-tag" *ngIf="item.freshness && !item.freshness.is_fresh">stale</em>
+              <app-dose-band-badge [band]="item.risk_band" />
+            </span>
           </button>
           <div class="empty" *ngIf="!pending().length">No assessments are awaiting RPO review.</div>
         </aside>
         <section *ngIf="budget.selected() as selected" class="review-detail">
           <app-budget-evidence-panel [assessment]="selected" />
+          <app-assessment-freshness-panel [assessment]="selected" />
+          <div *ngIf="isStale(selected) && selected.assessment_status === 'submitted'" class="stale-blocker">
+            <strong>Acceptance blocked by stale snapshot</strong>
+            <p>The accept action is disabled until the planner reassesses current exposure records and limits.
+               Rejecting the planning scenario stays available; returning it hands the plan back for a fresh assessment.</p>
+          </div>
           <form *ngIf="selected.assessment_status === 'submitted'" class="review-form" [formGroup]="form">
             <mat-form-field appearance="outline"><mat-label>RPO review note</mat-label><textarea matInput rows="3" formControlName="note"></textarea></mat-form-field>
-            <div>
+            <div class="review-actions">
               <button mat-button color="warn" type="button" [disabled]="form.invalid || saving()" (click)="review('reject')">Reject planning scenario</button>
-              <button mat-flat-button color="primary" type="button" [disabled]="form.invalid || saving()" (click)="review('accept')">Accept for planning</button>
+              <button mat-button type="button" [disabled]="saving()" (click)="returnForReassessment(selected)">Return for reassessment</button>
+              <button mat-flat-button color="primary" type="button"
+                      [disabled]="form.invalid || saving() || isStale(selected)"
+                      [title]="isStale(selected) ? 'Snapshot inputs changed; the assessment must be reassessed first' : ''">
+                Accept for planning
+              </button>
             </div>
           </form>
           <div *ngIf="selected.assessment_status !== 'submitted'" class="resolved">
@@ -76,7 +94,12 @@ import { apiErrorMessage } from '../utils/api-error';
     .queue > button:hover, .queue > button.active { background: #e8eeea; } .queue > button.active { box-shadow: inset 3px 0 #286858; }
     .queue button span, .queue button small { display: block; } .queue button small { margin-top: 4px; color: var(--muted); font-size: 10px; }
     .review-form { display: grid; gap: 8px; margin-top: 10px; padding: 16px; background: #e8eeea; border: 1px solid var(--line); }
-    .review-form div { display: flex; justify-content: flex-end; gap: 10px; }
+    .review-actions { display: flex; justify-content: flex-end; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .queue-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+    .stale-tag { font-style: normal; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; color: #fff; background: #b35440; border-radius: 3px; padding: 2px 6px; }
+    .stale-blocker { margin-top: 10px; padding: 13px 16px; background: #f7e0db; border: 1px solid #c9877d; color: #6b2a1d; }
+    .stale-blocker strong { display: block; margin-bottom: 4px; font-size: 13px; }
+    .stale-blocker p { margin: 0; font-size: 12px; line-height: 1.5; }
     .resolved { margin-top: 10px; padding: 14px; border: 1px solid var(--line); background: #f8f8f3; }
     .resolved strong { display: block; text-transform: capitalize; } .resolved span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
     .audit-table code { display: block; max-width: 360px; white-space: normal; overflow-wrap: anywhere; color: #34413e; font-size: 10px; }
@@ -103,8 +126,33 @@ export class AuditPage implements OnInit {
     this.budget.review(selected.id, selected.plan_version, decision, this.form.controls.note.value)
       .pipe(finalize(() => this.saving.set(false))).subscribe({
         next: () => { this.form.reset(); this.loadAudit(); },
+        error: error => {
+          this.error.set(apiErrorMessage(error));
+          if (this.errorCode(error) === 'stale_snapshot') {
+            this.budget.load();
+          }
+        },
+      });
+  }
+
+  isStale(assessment: DoseBudgetAssessment): boolean {
+    return assessment.freshness !== undefined && !assessment.freshness.is_fresh;
+  }
+
+  returnForReassessment(selected: DoseBudgetAssessment): void {
+    this.saving.set(true); this.error.set('');
+    this.budget.returnForReassessment(selected.id, selected.plan_version)
+      .pipe(finalize(() => this.saving.set(false))).subscribe({
+        next: () => { this.budget.load(); this.loadAudit(); },
         error: error => this.error.set(apiErrorMessage(error)),
       });
+  }
+
+  private errorCode(error: unknown): string {
+    if (error instanceof HttpErrorResponse) {
+      return error.error?.error?.code ?? '';
+    }
+    return '';
   }
 
   private refresh(): void {

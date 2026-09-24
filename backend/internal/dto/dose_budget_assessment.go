@@ -19,6 +19,41 @@ type AssessmentReviewRequest struct {
 	Version  uint   `json:"version" validate:"required,gt=0"`
 }
 
+type AssessmentFreshnessEntryChange struct {
+	EntryID       uint      `json:"entry_id"`
+	SourceRef     string    `json:"source_ref"`
+	ChangeType    string    `json:"change_type"`
+	QualityFlag   string    `json:"quality_flag"`
+	DoseMSV       float64   `json:"dose_msv"`
+	OccurredAt    time.Time `json:"occurred_at"`
+	SnapshotState string    `json:"snapshot_state"`
+	CurrentState  string    `json:"current_state"`
+}
+
+type AssessmentFreshnessLimitChange struct {
+	LimitName   string  `json:"limit_name"`
+	ChangeType  string  `json:"change_type"`
+	SnapshotMSV float64 `json:"snapshot_msv"`
+	CurrentMSV  float64 `json:"current_msv"`
+}
+
+type AssessmentFreshness struct {
+	IsFresh               bool                             `json:"is_fresh"`
+	CheckedAt             time.Time                        `json:"checked_at"`
+	SnapshotWorkerVersion uint                             `json:"snapshot_worker_version"`
+	CurrentWorkerVersion  uint                             `json:"current_worker_version"`
+	SnapshotPeriodDoseMSV float64                          `json:"snapshot_period_dose_msv"`
+	CurrentPeriodDoseMSV  float64                          `json:"current_period_dose_msv"`
+	PeriodDoseDeltaMSV    float64                          `json:"period_dose_delta_msv"`
+	EntryChanges          []AssessmentFreshnessEntryChange `json:"entry_changes"`
+	LimitChanges          []AssessmentFreshnessLimitChange `json:"limit_changes"`
+	ThresholdChanged      bool                             `json:"threshold_changed"`
+	SnapshotThreshold     string                           `json:"snapshot_threshold_version"`
+	CurrentThreshold      string                           `json:"current_threshold_version"`
+	ReasonCodes           []string                         `json:"reason_codes"`
+	Reasons               []string                         `json:"reasons"`
+}
+
 type DoseEvidence struct {
 	PeriodStart          time.Time `json:"period_start"`
 	PeriodEnd            time.Time `json:"period_end"`
@@ -54,6 +89,7 @@ type DoseBudgetAssessmentResponse struct {
 	ThresholdVersion  string                 `json:"threshold_version"`
 	PlanVersion       uint                   `json:"plan_version"`
 	WorkerVersion     uint                   `json:"worker_version"`
+	Freshness         *AssessmentFreshness   `json:"freshness,omitempty"`
 	CreatedAt         time.Time              `json:"created_at"`
 	ReviewedBy        *uint                  `json:"reviewed_by,omitempty"`
 	ReviewedAt        *time.Time             `json:"reviewed_at,omitempty"`

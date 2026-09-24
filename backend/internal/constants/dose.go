@@ -19,6 +19,7 @@ var DoseBands = []string{
 const (
 	AssessmentStatusCalculated = "calculated"
 	AssessmentStatusSubmitted  = "submitted"
+	AssessmentStatusReturned   = "returned"
 	AssessmentStatusAccepted   = "accepted"
 	AssessmentStatusRejected   = "rejected"
 )

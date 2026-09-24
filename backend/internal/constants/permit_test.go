@@ -11,9 +11,12 @@ func TestPermitStatusTransitions(t *testing.T) {
 		{PermitStatusAssessed, PermitStatusPendingRPOReview, true},
 		{PermitStatusPendingRPOReview, PermitStatusPlanningAccepted, true},
 		{PermitStatusPendingRPOReview, PermitStatusRejected, true},
+		{PermitStatusPendingRPOReview, PermitStatusAssessed, true},
 		{PermitStatusPlanningAccepted, PermitStatusArchived, true},
 		{PermitStatusDraft, PermitStatusPlanningAccepted, false},
 		{PermitStatusPlanningAccepted, PermitStatusPendingRPOReview, false},
+		{PermitStatusAssessed, PermitStatusPlanningAccepted, false},
+		{PermitStatusRejected, PermitStatusAssessed, false},
 	}
 	for _, test := range tests {
 		if got := CanTransitionPermit(test.from, test.to); got != test.want {

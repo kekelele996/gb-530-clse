@@ -48,8 +48,9 @@ docker compose down -v --remove-orphans
 - 不可变更正：原值禁止覆盖；一次更正事务创建负值 reversal 和新 replacement，完整保留链路。
 - 作业计划：使用统一 mSv/mSv/h 单位维护剂量率、分钟数和具体控制措施。
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
+- 快照新鲜度：评估详情按当前暴露台账与人员限值重放期间数据，列出新增/质量变化记录、限值调整、阈值版本漂移与期间剂量净差异；复核接受会被过期快照拦截，RPO 可退回重评，旧快照保留可追溯。
 - 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
-- 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
+- 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`；`pending_rpo_review -> assessed` 仅用于过期快照退回重评。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
 
 ## 公式、周期与阈值
@@ -128,10 +129,11 @@ docker compose down -v --remove-orphans
 | GET/POST | `/assessments[/:id]` | 列表、详情和不可变评估 |
 | POST | `/assessments/compare` | 同一人员多计划情景比较 |
 | POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
-| POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
+| POST | `/assessments/:id/return` | RPO 将过期快照退回重评（计划回到 assessed，旧快照保留） |
+| POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝（接受前服务端强制新鲜度检查） |
 | GET | `/audit` | RPO/admin 查询审计 |
 
-错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict` 和 `forbidden`。
+错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict`、`stale_snapshot`（快照已过期、接受被阻断）、`fresh_snapshot`（输入未变化、无需退回）和 `forbidden`。
 
 ## 枚举位置
 
@@ -213,6 +215,7 @@ scripts/api_smoke.sh
 - **前端 API 404**：通过 `http://localhost:18530` 访问；Nginx 会保留 `/api/v1` 路径代理到 `backend:8080`。
 - **409 duplicate_source_ref**：来源引用全局唯一。不得覆盖旧记录，应由 RPO 使用 correction API。
 - **409 version_conflict**：其他操作已推进计划版本；重新加载后基于最新输入生成新评估。
+- **409 stale_snapshot**：评估提交后又有核验暴露记录写入（含更正链）、人员限值或阈值配置发生变化；接受操作被拦截。详情接口的 `freshness` 字段列出具体记录/限值变化和期间剂量净差异，RPO 可调用 `/return` 退回，规划员重新评估后旧快照仍可追溯。
 - **风险带没有因接受而变绿**：这是预期行为。RPO 处置不改变客观投影或阈值证据。
 
 ## License

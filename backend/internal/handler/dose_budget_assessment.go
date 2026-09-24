@@ -90,6 +90,25 @@ func (handler *DoseBudgetAssessmentHandler) Submit(context *gin.Context) {
 	WriteData(context, http.StatusOK, item)
 }
 
+func (handler *DoseBudgetAssessmentHandler) ReturnForReassessment(context *gin.Context) {
+	id, err := PathID(context)
+	if err != nil {
+		WriteError(context, err)
+		return
+	}
+	var request dto.PlanVersionRequest
+	if err := BindAndValidate(context, &request); err != nil {
+		WriteError(context, err)
+		return
+	}
+	item, err := handler.service.ReturnForReassessment(id, request, Actor(context), RequestID(context))
+	if err != nil {
+		WriteError(context, err)
+		return
+	}
+	WriteData(context, http.StatusOK, item)
+}
+
 func (handler *DoseBudgetAssessmentHandler) Review(context *gin.Context) {
 	id, err := PathID(context)
 	if err != nil {
